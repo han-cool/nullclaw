@@ -88,25 +88,30 @@ fn processTelegramMessage(
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again or /new for a fresh session.",
         };
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
     defer allocator.free(reply);
 
     if (shouldSuppressGroupReply(is_group, reply)) {
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         log.info("Smart reply: skipping non-essential message", .{});
         return;
     }
 
     if (sink != null) {
-        tg_ptr.channel().sendEvent(sender, reply, &.{}, .final) catch |err| {
-            log.warn("Send error: {}", .{err});
-        };
-    } else {
-        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
-            log.warn("Send error: {}", .{err});
+        tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch |err| {
+            log.warn("Draft cleanup error: {}", .{err});
         };
     }
+    tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+        log.warn("Send error: {}", .{err});
+    };
 }
 
 /// Task context for processing a message in a worker thread.

@@ -2429,7 +2429,12 @@ pub const TelegramChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        if (!self.streaming_enabled) return;
+        if (!self.streaming_enabled) {
+            if (stage == .final and message.len > 0) {
+                return vtableSend(ptr, target, message, &.{});
+            }
+            return;
+        }
 
         switch (stage) {
             .chunk => {
