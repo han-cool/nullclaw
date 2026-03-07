@@ -36,6 +36,10 @@ pub const SandboxBackend = enum {
 
 pub const ProviderEntry = struct {
     name: []const u8,
+    /// Provider credential payload.
+    /// Usually a string API key/token.
+    /// For providers that support structured credentials (e.g. Vertex service-account JSON),
+    /// the parser accepts object/array JSON and stores it as a compact JSON string.
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
@@ -62,6 +66,9 @@ pub const DiagnosticsConfig = struct {
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    /// Optional max length for user-visible provider/API errors after scrubbing.
+    /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
+    api_error_max_chars: ?u32 = null,
     /// Emit info logs for every executed tool call (name/id/duration/success).
     /// Arguments and tool output are never logged.
     log_tool_calls: bool = false,
@@ -74,6 +81,15 @@ pub const DiagnosticsConfig = struct {
     /// Emit request/response payloads around provider chat calls.
     /// Intended for local debugging only (can include sensitive text).
     log_llm_io: bool = false,
+    /// Persist per-response token counters to a JSONL ledger near config.json.
+    /// This stores token counts only (provider/model/prompt/completion/total), not message text.
+    token_usage_ledger_enabled: bool = true,
+    /// Reset token usage ledger after this many hours. 0 disables time-based reset.
+    token_usage_ledger_window_hours: u32 = 24,
+    /// Maximum ledger file size before reset. 0 disables size-based reset.
+    token_usage_ledger_max_bytes: u64 = 0,
+    /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
+    token_usage_ledger_max_lines: u64 = 0,
 };
 
 pub const AutonomyConfig = struct {
@@ -83,6 +99,9 @@ pub const AutonomyConfig = struct {
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
+    /// When true, skip the single-`&` shell-operator check so that bare
+    /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
+    allow_raw_url_chars: bool = false,
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
@@ -127,6 +146,32 @@ pub const SchedulerConfig = struct {
     agent_timeout_secs: u64 = 0,
 };
 
+// ── Tool filter groups ──────────────────────────────────────────
+
+/// Controls which MCP tools are included in the schema sent to the LLM each turn.
+///
+/// Two modes:
+///   - `always`:  tools matching `tools` patterns are always included (no keywords needed).
+///   - `dynamic`: tools matching `tools` patterns are included only when the user message
+///                contains at least one of the `keywords` (case-insensitive substring match).
+///
+/// Built-in (non-MCP) tools are always included regardless of filter groups.
+/// If no filter groups are configured, all tools pass through unchanged.
+pub const ToolFilterGroupMode = enum {
+    always,
+    dynamic,
+};
+
+pub const ToolFilterGroup = struct {
+    mode: ToolFilterGroupMode,
+    /// Glob patterns matched against tool names (e.g. "mcp_vikunja_*").
+    /// Supports `*` wildcard only (prefix/suffix/infix).
+    tools: []const []const u8 = &.{},
+    /// Keywords for `dynamic` mode — case-insensitive substring match against user message.
+    /// Ignored when mode is `always`.
+    keywords: []const []const u8 = &.{},
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
@@ -145,6 +190,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
+    /// See ToolFilterGroup for semantics.
+    tool_filter_groups: []const ToolFilterGroup = &.{},
 };
 
 pub const ToolsConfig = struct {
@@ -194,6 +242,8 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
+    /// Stream partial responses to users via sendMessageDraft before the final message.
+    streaming: bool = true,
 };
 
 pub const DiscordConfig = struct {
@@ -681,6 +731,8 @@ pub const ChannelsConfig = struct {
 
 /// Memory configuration profile presets.
 pub const MemoryProfile = enum {
+    /// Hybrid: SQLite backend with workspace bootstrap files.
+    hybrid_keyword,
     /// SQLite keyword-only (default).
     local_keyword,
     /// File-based markdown memory.
@@ -697,6 +749,7 @@ pub const MemoryProfile = enum {
     custom,
 
     pub fn fromString(s: []const u8) MemoryProfile {
+        if (std.mem.eql(u8, s, "hybrid_keyword")) return .hybrid_keyword;
         if (std.mem.eql(u8, s, "local_keyword")) return .local_keyword;
         if (std.mem.eql(u8, s, "markdown_only")) return .markdown_only;
         if (std.mem.eql(u8, s, "postgres_keyword")) return .postgres_keyword;
@@ -708,11 +761,12 @@ pub const MemoryProfile = enum {
 };
 
 pub const MemoryConfig = struct {
-    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "hybrid";
 
     /// Profile preset — convenience shortcut for common setups.
-    profile: []const u8 = "markdown_only",
+    profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
@@ -731,6 +785,9 @@ pub const MemoryConfig = struct {
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
+            .hybrid_keyword => {
+                // Base default is already hybrid.
+            },
             .local_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
@@ -833,6 +890,9 @@ pub const MemoryVectorStoreConfig = struct {
     qdrant_api_key: []const u8 = "",
     qdrant_collection: []const u8 = "nullclaw_memories",
     pgvector_table: []const u8 = "memory_embeddings",
+    // sqlite_ann (experimental): candidate prefilter tuning.
+    ann_candidate_multiplier: u32 = 12,
+    ann_min_candidates: u32 = 64,
 };
 
 pub const MemoryChunkingConfig = struct {
@@ -884,6 +944,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
+    preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
@@ -1010,6 +1071,9 @@ pub const HttpRequestConfig = struct {
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
+    /// Optional outbound proxy URL used for provider/network curl requests.
+    /// Supported schemes: http://, https://, socks5://
+    proxy: ?[]const u8 = null,
     /// Optional SearXNG instance URL used by web_search as a fallback when
     /// BRAVE_API_KEY is not available.
     /// Examples:
@@ -1071,6 +1135,48 @@ pub const HttpRequestConfig = struct {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return false;
         return isValidSearchProviderName(trimmed);
+    }
+
+    pub fn isValidProxyUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        const scheme_ok = std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+            std.ascii.eqlIgnoreCase(uri.scheme, "https") or
+            std.ascii.eqlIgnoreCase(uri.scheme, "socks5");
+        if (!scheme_ok) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                // Reject percent-escaped hosts like %31%32%37.0.0.1.
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (host[0] == ':') return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (uri.port) |port| {
+            if (port == 0) return false;
+        }
+
+        const path = switch (uri.path) {
+            .raw => |p| p,
+            .percent_encoded => |p| p,
+        };
+        if (path.len > 0 and !std.mem.eql(u8, path, "/")) return false;
+        return true;
     }
 };
 
@@ -1246,17 +1352,37 @@ test "WebConfig defaults" {
 }
 
 test "security defaults stay least-privilege" {
+    const diagnostics = DiagnosticsConfig{};
+    try std.testing.expect(diagnostics.api_error_max_chars == null);
+
     const autonomy = AutonomyConfig{};
     try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
     try std.testing.expect(autonomy.workspace_only);
     try std.testing.expectEqual(@as(u32, 20), autonomy.max_actions_per_hour);
     try std.testing.expect(autonomy.require_approval_for_medium_risk);
     try std.testing.expect(autonomy.block_high_risk_commands);
+    try std.testing.expect(!autonomy.allow_raw_url_chars);
 
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);
+    try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "HttpRequestConfig proxy URL validation" {
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("http://127.0.0.1:8080"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("https://proxy.example.com:8443"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("socks5://127.0.0.1:1080"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl(""));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("proxy.example.com:8080"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("ftp://proxy.example.com:21"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http:///"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://:8080"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/path"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
 }
 
 test "WebConfig normalizePath trims and normalizes" {

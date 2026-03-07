@@ -25,6 +25,8 @@ const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
+const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
+const NS_PER_SEC: i128 = std.time.ns_per_s;
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -44,6 +46,7 @@ pub const Session = struct {
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
+    turn_running: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -69,6 +72,10 @@ pub const SessionManager = struct {
     policy: ?*const SecurityPolicy = null,
 
     mutex: std.Thread.Mutex,
+    usage_log_mutex: std.Thread.Mutex,
+    usage_ledger_state_initialized: bool,
+    usage_ledger_window_started_at: i64,
+    usage_ledger_line_count: u64,
     sessions: std.StringHashMapUnmanaged(*Session),
 
     pub fn init(
@@ -93,6 +100,10 @@ pub const SessionManager = struct {
             .response_cache = response_cache,
             .observer = observer_i,
             .mutex = .{},
+            .usage_log_mutex = .{},
+            .usage_ledger_state_initialized = false,
+            .usage_ledger_window_started_at = 0,
+            .usage_ledger_line_count = 0,
             .sessions = .{},
         };
     }
@@ -136,6 +147,10 @@ pub const SessionManager = struct {
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
+        if (self.config.diagnostics.token_usage_ledger_enabled) {
+            agent.usage_record_callback = usageRecordForwarder;
+            agent.usage_record_ctx = @ptrCast(self);
+        }
 
         session.* = .{
             .agent = agent,
@@ -144,6 +159,7 @@ pub const SessionManager = struct {
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
+            .turn_running = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
         // From here, session owns agent — must deinit on error.
@@ -196,6 +212,144 @@ pub const SessionManager = struct {
         streaming.forwardProviderChunk(adapter.sink, chunk);
     }
 
+    fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
+        const self: *SessionManager = @ptrCast(@alignCast(ctx_ptr));
+        self.appendUsageRecord(record);
+    }
+
+    fn usageLedgerPath(self: *SessionManager) ?[]u8 {
+        if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
+        const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
+        return std.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
+    }
+
+    fn usageWindowSeconds(self: *SessionManager) i64 {
+        const hours = self.config.diagnostics.token_usage_ledger_window_hours;
+        if (hours == 0) return 0;
+        return @as(i64, @intCast(hours)) * 60 * 60;
+    }
+
+    fn countLedgerLines(file: *std.fs.File) !u64 {
+        try file.seekTo(0);
+        var lines: u64 = 0;
+        var saw_data = false;
+        var last_byte: u8 = '\n';
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = try file.read(&buf);
+            if (n == 0) break;
+            saw_data = true;
+            last_byte = buf[n - 1];
+            lines += @intCast(std.mem.count(u8, buf[0..n], "\n"));
+        }
+        if (saw_data and last_byte != '\n') lines += 1;
+        return lines;
+    }
+
+    fn initializeUsageLedgerState(
+        self: *SessionManager,
+        file: *std.fs.File,
+        stat: std.fs.File.Stat,
+        now_ts: i64,
+    ) void {
+        if (self.usage_ledger_state_initialized) return;
+        self.usage_ledger_state_initialized = true;
+        if (stat.size > 0) {
+            const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, NS_PER_SEC));
+            self.usage_ledger_window_started_at = if (mtime_secs > 0) mtime_secs else now_ts;
+            if (self.config.diagnostics.token_usage_ledger_max_lines > 0) {
+                self.usage_ledger_line_count = countLedgerLines(file) catch 0;
+            } else {
+                self.usage_ledger_line_count = 0;
+            }
+        } else {
+            self.usage_ledger_window_started_at = now_ts;
+            self.usage_ledger_line_count = 0;
+        }
+    }
+
+    fn shouldResetUsageLedger(
+        self: *SessionManager,
+        stat: std.fs.File.Stat,
+        now_ts: i64,
+        pending_bytes: usize,
+        pending_lines: u64,
+    ) bool {
+        const window_secs = self.usageWindowSeconds();
+        if (window_secs > 0) {
+            const started_at = self.usage_ledger_window_started_at;
+            if (started_at > 0 and now_ts - started_at >= window_secs) return true;
+        }
+
+        const max_bytes = self.config.diagnostics.token_usage_ledger_max_bytes;
+        if (max_bytes > 0) {
+            const projected = @as(u64, @intCast(stat.size)) + @as(u64, @intCast(pending_bytes));
+            if (projected > max_bytes) return true;
+        }
+
+        const max_lines = self.config.diagnostics.token_usage_ledger_max_lines;
+        if (max_lines > 0 and self.usage_ledger_line_count + pending_lines > max_lines) return true;
+
+        return false;
+    }
+
+    fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
+        self.usage_log_mutex.lock();
+        defer self.usage_log_mutex.unlock();
+
+        const ledger_path = self.usageLedgerPath() orelse return;
+        defer self.allocator.free(ledger_path);
+
+        var file = std.fs.openFileAbsolute(ledger_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => std.fs.createFileAbsolute(ledger_path, .{ .truncate = false, .read = true }) catch return,
+            else => return,
+        };
+        var file_needs_close = true;
+        defer if (file_needs_close) file.close();
+
+        const now_ts = std.time.timestamp();
+        const stat = file.stat() catch return;
+        self.initializeUsageLedgerState(&file, stat, now_ts);
+
+        const record_line = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
+            .{
+                record.ts,
+                std.json.fmt(record.provider, .{}),
+                std.json.fmt(record.model, .{}),
+                record.usage.prompt_tokens,
+                record.usage.completion_tokens,
+                record.usage.total_tokens,
+                record.success,
+            },
+        ) catch return;
+        defer self.allocator.free(record_line);
+
+        const pending_bytes: usize = record_line.len;
+        if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
+            file.close();
+            file_needs_close = false;
+            file = std.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
+            file_needs_close = true;
+            self.usage_ledger_state_initialized = true;
+            self.usage_ledger_window_started_at = now_ts;
+            self.usage_ledger_line_count = 0;
+        }
+
+        // Zig 0.15 buffered File.writer ignores manual seek position for append-style writes.
+        // Use direct file.writeAll after seek to guarantee true append semantics.
+        file.seekFromEnd(0) catch return;
+        file.writeAll(record_line) catch return;
+
+        if (self.usage_ledger_window_started_at == 0) {
+            self.usage_ledger_window_started_at = now_ts;
+        }
+        if (self.config.diagnostics.token_usage_ledger_max_lines > 0) {
+            self.usage_ledger_line_count += 1;
+        }
+    }
+
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
@@ -226,7 +380,7 @@ pub const SessionManager = struct {
                     session_hash,
                     content.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -235,6 +389,11 @@ pub const SessionManager = struct {
 
         session.mutex.lock();
         defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
@@ -290,12 +449,37 @@ pub const SessionManager = struct {
                     session_hash,
                     response.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
 
         return response;
+    }
+
+    pub const InterruptRequestResult = struct {
+        requested: bool = false,
+        active_tool: ?[]u8 = null,
+
+        pub fn deinit(self: *InterruptRequestResult, allocator: Allocator) void {
+            if (self.active_tool) |name| allocator.free(name);
+            self.active_tool = null;
+        }
+    };
+
+    /// Request interruption of a currently running turn for a session.
+    /// Returns whether it was signaled and the active tool snapshot (if any).
+    pub fn requestTurnInterrupt(self: *SessionManager, session_key: []const u8) InterruptRequestResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(session_key) orelse return .{};
+        if (!session.turn_running.load(.acquire)) return .{};
+        session.agent.requestInterrupt();
+        return .{
+            .requested = true,
+            .active_tool = session.agent.snapshotActiveToolName(self.allocator) catch null,
+        };
     }
 
     /// Number of active sessions.
@@ -554,6 +738,252 @@ test "SessionManager init/deinit — no leaks" {
     sm.deinit();
 }
 
+test "usage ledger appends records when retention limits are disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 101,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 102,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 2, .total_tokens = 4 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":101") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
+}
+
+test "usage ledger resets when max line limit is reached" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 2;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 1,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 2, .total_tokens = 3 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 2,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 3, .total_tokens = 5 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 3,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 3, .completion_tokens = 4, .total_tokens = 7 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger resets when window expires" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 1;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 10,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+        .success = true,
+    });
+
+    sm.usage_ledger_state_initialized = true;
+    sm.usage_ledger_window_started_at = std.time.timestamp() - 2 * 60 * 60;
+
+    sm.appendUsageRecord(.{
+        .ts = 11,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 2, .total_tokens = 4 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":11") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger resets when byte limit would be exceeded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 140;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 21,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 2, .total_tokens = 3 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 22,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 3, .total_tokens = 5 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":22") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger records failed response flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 31,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 0, .completion_tokens = 0, .total_tokens = 0 },
+        .success = false,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":31") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":false") != null);
+}
+
 test "getOrCreate creates new session for unknown key" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -610,8 +1040,50 @@ test "session has correct initial state" {
 
     const s = try sm.getOrCreate("test:init");
     try testing.expectEqual(@as(u64, 0), s.turn_count);
+    try testing.expect(!s.turn_running.load(.acquire));
     try testing.expect(!s.agent.has_system_prompt);
     try testing.expectEqual(@as(usize, 0), s.agent.historyLen());
+}
+
+test "requestTurnInterrupt signals only active sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:1");
+    var none = sm.requestTurnInterrupt("interrupt:1");
+    defer none.deinit(testing.allocator);
+    try testing.expect(!none.requested);
+
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    var yes = sm.requestTurnInterrupt("interrupt:1");
+    defer yes.deinit(testing.allocator);
+    try testing.expect(yes.requested);
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+}
+
+test "requestTurnInterrupt returns active tool snapshot when available" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:tool");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    session.agent.tool_state_mu.lock();
+    if (session.agent.active_tool_name) |old| testing.allocator.free(old);
+    session.agent.active_tool_name = try testing.allocator.dupe(u8, "shell");
+    session.agent.tool_state_mu.unlock();
+
+    var res = sm.requestTurnInterrupt("interrupt:tool");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res.requested);
+    try testing.expect(res.active_tool != null);
+    try testing.expectEqualStrings("shell", res.active_tool.?);
 }
 
 // ---------------------------------------------------------------------------

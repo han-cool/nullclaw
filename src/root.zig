@@ -33,6 +33,8 @@ pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");
 pub const export_manifest = @import("export_manifest.zig");
 pub const list_models = @import("list_models.zig");
+pub const provider_probe = @import("provider_probe.zig");
+pub const channel_probe = @import("channel_probe.zig");
 pub const from_json = @import("from_json.zig");
 
 // Phase 2: Agent core
@@ -40,6 +42,7 @@ pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
+pub const bootstrap = @import("bootstrap/root.zig");
 
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
@@ -60,6 +63,7 @@ pub const runtime = @import("runtime.zig");
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
 pub const subagent = @import("subagent.zig");
+pub const subagent_runner = @import("subagent_runner.zig");
 
 // Phase 4c: Auth
 pub const auth = @import("auth.zig");

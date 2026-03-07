@@ -65,11 +65,19 @@ fn parseCommand(arg: []const u8) ?Command {
     return command_map.get(arg);
 }
 
-pub fn main() !void {
-    // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
+extern "kernel32" fn SetConsoleCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+
+fn configureWindowsConsoleUtf8() void {
     if (comptime builtin.os.tag == .windows) {
+        // Set both output and input code pages to UTF-8 so interactive
+        // terminal sessions preserve non-ASCII user input.
         _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
+        _ = SetConsoleCP(65001);
     }
+}
+
+pub fn main() !void {
+    configureWindowsConsoleUtf8();
 
     const allocator = std.heap.smp_allocator;
 
@@ -88,6 +96,14 @@ pub fn main() !void {
     }
     if (std.mem.eql(u8, args[1], "--list-models")) {
         try yc.list_models.run(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "--probe-provider-health")) {
+        try yc.provider_probe.run(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "--probe-channel-health")) {
+        try yc.channel_probe.run(allocator, args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "--from-json")) {
@@ -135,6 +151,17 @@ fn printVersion() void {
 
 const GatewayDaemonOverrideError = error{InvalidPort};
 
+fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
+    yc.http_util.setProxyOverride(config.http_request.proxy) catch |err| {
+        std.debug.print("Invalid http_request.proxy override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    yc.providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars) catch |err| {
+        std.debug.print("Invalid diagnostics.api_error_max_chars override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -172,6 +199,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&cfg);
 
     try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
@@ -687,6 +715,11 @@ fn printWorkspaceUsage() void {
         \\Usage: nullclaw workspace <command> [args]
         \\
         \\Commands:
+        \\  edit <filename>
+        \\      Open a bootstrap file (SOUL.md, AGENTS.md, etc.) in $EDITOR.
+        \\      For file-based backends (markdown, hybrid) edits the file directly.
+        \\      For DB-backed backends, use the agent's memory_store tool instead.
+        \\
         \\  reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
         \\      Reset prompt markdown files (AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT)
         \\      to bundled defaults.
@@ -969,6 +1002,11 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
     defer cfg.deinit();
 
     const subcmd = sub_args[0];
+    if (std.mem.eql(u8, subcmd, "edit")) {
+        runWorkspaceEdit(allocator, sub_args[1..], cfg);
+        return;
+    }
+
     if (!std.mem.eql(u8, subcmd, "reset-md")) {
         std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
         printWorkspaceUsage();
@@ -1004,6 +1042,7 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
             .clear_memory_markdown = clear_memory_md,
             .dry_run = dry_run,
         },
+        null,
     );
 
     if (dry_run) {
@@ -1017,6 +1056,63 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
             .{ report.rewritten_files, report.removed_files },
         );
     }
+}
+
+fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) void {
+    if (args.len < 1) {
+        std.debug.print("Usage: nullclaw workspace edit <filename>\n\n", .{});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.process.exit(1);
+    }
+    const filename = args[0];
+
+    if (!yc.bootstrap.isBootstrapFilename(filename)) {
+        std.debug.print("Not a bootstrap file: {s}\n", .{filename});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.process.exit(1);
+    }
+
+    // Only file-based backends (markdown, hybrid) support direct editing.
+    if (!yc.memory.usesWorkspaceBootstrapFiles(cfg.memory.backend)) {
+        std.debug.print(
+            "The '{s}' backend stores bootstrap files in the database.\n" ++
+                "Edit bootstrap files through the agent using the memory_store tool,\n" ++
+                "or switch to the hybrid backend for file-based editing.\n",
+            .{cfg.memory.backend},
+        );
+        std.process.exit(1);
+    }
+
+    const filepath = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.workspace_dir, filename }) catch {
+        std.debug.print("Failed to build file path\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(filepath);
+
+    // Determine editor: $VISUAL, $EDITOR, fallback to vi
+    var editor_owned = getEnvVarOwnedOrNull(allocator, "VISUAL");
+    if (editor_owned == null) {
+        editor_owned = getEnvVarOwnedOrNull(allocator, "EDITOR");
+    }
+    defer if (editor_owned) |value| allocator.free(value);
+    const editor = if (editor_owned) |value| value else "vi";
+
+    var child = std.process.Child.init(&.{ editor, filepath }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    _ = child.spawnAndWait() catch |err| {
+        std.debug.print("Failed to launch editor '{s}': {s}\n", .{ editor, @errorName(err) });
+        std.process.exit(1);
+    };
+}
+
+fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => null,
+    };
 }
 
 fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1112,6 +1208,7 @@ const OnboardArgs = struct {
     mode: OnboardMode = .quick,
     api_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
     memory_backend: ?[]const u8 = null,
 };
 
@@ -1151,6 +1248,12 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
             parsed.provider = sub_args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--model")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.model = sub_args[i];
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--memory")) {
             if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
             i += 1;
@@ -1175,7 +1278,7 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
 
 fn printOnboardUsage() void {
     std.debug.print(
-        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--memory MEM]]
+        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]]
         \\
         \\Modes:
         \\  (default)         quick setup
@@ -1184,11 +1287,13 @@ fn printOnboardUsage() void {
         \\
         \\Quick setup options:
         \\  --api-key KEY     provider API key to persist in config
-        \\  --provider PROV   default provider key (e.g. openrouter, anthropic)
+        \\  --provider PROV   default provider key (e.g. openrouter, anthropic, custom:https://...)
+        \\  --model MODEL     default model for the provider (e.g. gpt-5.2, claude-opus-4-6)
         \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory)
         \\
         \\Examples:
         \\  nullclaw onboard --api-key sk-... --provider openrouter
+        \\  nullclaw onboard --api-key sk-... --provider custom:https://api.example.com/v1 --model minimaxai/minimax-m2.1
         \\  nullclaw onboard --interactive
         \\
     , .{});
@@ -1247,7 +1352,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     switch (parsed.mode) {
         .channels_only => try yc.onboard.runChannelsOnly(allocator),
         .interactive => try yc.onboard.runWizard(allocator),
-        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.memory_backend) catch |err| switch (err) {
+        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
             error.UnknownProvider => {
                 const requested = parsed.provider orelse "(missing)";
                 std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
@@ -1406,6 +1511,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&config);
 
     if (!hasConfiguredStartableChannels(&config)) {
         if (hasConfiguredButBuildDisabledStartableChannels(&config)) {
@@ -1635,15 +1741,30 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .autonomy = config.autonomy.level,
         .workspace_dir = config.workspace_dir,
         .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
+    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
+
+    // Create optional memory backend (don't fail if unavailable).
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
+        allocator,
+        config.memory.backend,
+        mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
@@ -1663,17 +1784,14 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
         .subagent_manager = &subagent_manager,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
     }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
@@ -1944,15 +2062,30 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .autonomy = config.autonomy.level,
         .workspace_dir = config.workspace_dir,
         .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
+    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
+
+    // Create optional memory backend (don't fail if unavailable).
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
+        allocator,
+        config.memory.backend,
+        mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
@@ -1972,17 +2105,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
         .subagent_manager = &subagent_manager,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
     }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
@@ -2494,7 +2624,7 @@ fn printUsage() void {
         \\  help        Show this help
         \\
         \\OPTIONS:
-        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
+        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  version | --version | -V
@@ -2531,6 +2661,11 @@ test "parse known commands" {
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "configureWindowsConsoleUtf8 is safe to call" {
+    configureWindowsConsoleUtf8();
+    try std.testing.expect(true);
 }
 
 test "parsePositiveUsize accepts only positive integers" {

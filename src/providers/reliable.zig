@@ -289,6 +289,17 @@ pub const ReliableProvider = struct {
         return self.last_error_msg[0..self.last_error_len];
     }
 
+    fn maybeRecordFallbackErrorDetail(prov: Provider, err: anyerror) void {
+        if (err == error.ApiError or
+            err == error.RateLimited or
+            err == error.ContextLengthExceeded or
+            err == error.ProviderDoesNotSupportVision)
+        {
+            return;
+        }
+        root.setLastApiErrorDetail(prov.getName(), @errorName(err));
+    }
+
     fn finalFailureError(self: *const ReliableProvider) anyerror {
         const err_slice = self.lastErrorSlice();
         if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
@@ -305,6 +316,8 @@ pub const ReliableProvider = struct {
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
+        .supports_streaming = supportsStreamingImpl,
+        .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
@@ -330,9 +343,11 @@ pub const ReliableProvider = struct {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
+            root.clearLastApiErrorDetail();
             if (prov.chatWithSystem(allocator, system_prompt, message, current_model, 0.7)) |result| {
                 return result;
             } else |err| {
+                maybeRecordFallbackErrorDetail(prov, err);
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
 
@@ -364,9 +379,18 @@ pub const ReliableProvider = struct {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
+            root.clearLastApiErrorDetail();
             if (prov.chat(allocator, request, current_model, request.temperature)) |result| {
-                return result;
+                var annotated = result;
+                if (annotated.provider.len == 0) {
+                    annotated.provider = allocator.dupe(u8, prov.getName()) catch "";
+                }
+                if (annotated.model.len == 0) {
+                    annotated.model = allocator.dupe(u8, current_model) catch "";
+                }
+                return annotated;
             } else |err| {
+                maybeRecordFallbackErrorDetail(prov, err);
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
 
@@ -397,6 +421,7 @@ pub const ReliableProvider = struct {
     ) anyerror![]const u8 {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
+        root.clearLastApiErrorDetail();
 
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
@@ -439,6 +464,7 @@ pub const ReliableProvider = struct {
     ) anyerror!ChatResponse {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
+        root.clearLastApiErrorDetail();
 
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
@@ -468,6 +494,24 @@ pub const ReliableProvider = struct {
         }
 
         return self.finalFailureError();
+    }
+
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsStreaming();
+    }
+
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: root.ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.streamChat(allocator, request, model, temperature, callback, callback_ctx);
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -866,6 +910,27 @@ test "ReliableProvider vtable exhausts retries and returns error" {
     try std.testing.expect(mock.call_count == 3);
 }
 
+test "ReliableProvider records fallback detail for non-classified errors" {
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    var mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.ProviderError,
+        .supports_tools = false,
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectError(error.AllProvidersFailed, result);
+
+    const detail = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expectEqualStrings("MockProvider: ProviderError", detail);
+}
+
 test "ReliableProvider propagates context errors for recovery" {
     var mock = MockInnerProvider{
         .call_count = 0,
@@ -889,7 +954,11 @@ test "ReliableProvider vtable chat retries then recovers" {
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
     defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("MockProvider", result.provider);
+    try std.testing.expectEqualStrings("model", result.model);
     try std.testing.expect(mock.call_count == 2);
 }
 
@@ -1096,7 +1165,11 @@ test "multi-provider chat fallback" {
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
     defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expect(result.provider.len > 0);
+    try std.testing.expectEqualStrings("model", result.model);
     try std.testing.expect(primary.call_count == 1);
     try std.testing.expect(fallback.call_count == 1);
 }
