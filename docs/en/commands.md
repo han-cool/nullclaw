@@ -2,6 +2,8 @@
 
 This page groups the NullClaw CLI by task so you can find the right command quickly without scanning the full help output.
 
+`nullclaw help` gives the top-level summary; this page stays aligned with it and expands into the detailed subcommands and notes.
+
 ## Start with these
 
 - Show help: `nullclaw help`

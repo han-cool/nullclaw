@@ -19,6 +19,8 @@
 
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
+
 ```
 678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
 ```
